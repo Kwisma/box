@@ -501,6 +501,33 @@ EOF
   return 0
 }
 
+# 获取内核版本
+get_core_ua() {
+  local version
+
+  case "$bin_name" in
+    mihomo)
+      version=$(${bin_path} -v 2>/dev/null | grep -oE "v[0-9]+(\.[0-9]+)+" | head -1 | sed 's/^v//')
+      echo "ClashMeta/${version}"
+      ;;
+    sing-box)
+      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      echo "sing-box/${version}"
+      ;;
+    xray)
+      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      echo "Xray/${version}"
+      ;;
+    v2fly)
+      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      echo "v2fly/${version}"
+      ;;
+    *)
+      echo "${user_agent}"
+      ;;
+  esac
+}
+
 # 检查并更新订阅
 upsubs() {
   if [ "${update_subscription}" != "true" ]; then
@@ -551,7 +578,7 @@ upsubs() {
 
         if [ "${renew}" = "true" ] && [ "$i" -eq 0 ]; then
           log Info "检测到 renew=true, 仅使用第一个订阅链接更新"
-          if LOG_MASK_URL=mask upfile "${mihomo_config}" "${url}" "ClashMeta"; then
+          if LOG_MASK_URL=mask upfile "${mihomo_config}" "${url}" "$(get_core_ua)"; then
             log Info "${mihomo_config} 更新成功"
             if [ -f "${box_pid}" ]; then
               kill -0 "$(<"${box_pid}" 2>/dev/null)" && \
@@ -565,7 +592,7 @@ upsubs() {
           fi
         fi
         
-        if LOG_MASK_URL=mask upfile "${provider_file}" "${url}" "ClashMeta"; then
+        if LOG_MASK_URL=mask upfile "${provider_file}" "${url}" "$(get_core_ua)"; then
           log Debug "文件大小: $(wc -c < "${provider_file}" 2>/dev/null || echo "未知") 字节"
           log Debug "文件路径: ${provider_file}"
           
@@ -659,7 +686,7 @@ upsubs() {
       if [ -n "${subscription_url_singbox}" ]; then
         log Info "${bin_name} 每日更新订阅 → $(date)"
         log Debug "正在下载 ${update_file_name}"
-        if upfile "${update_file_name}" "${subscription_url_singbox}" "sing-box"; then
+        if upfile "${update_file_name}" "${subscription_url_singbox}" "$(get_core_ua)"; then
           log Info "${update_file_name} 已保存"
           log Info "更新订阅于 $(date +"%F %R")"
           if [ -f "${box_pid}" ]; then
