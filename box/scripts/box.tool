@@ -503,23 +503,34 @@ EOF
 
 # 获取内核版本
 get_core_ua() {
-  local version
+  local version output
 
   case "$bin_name" in
     mihomo)
-      version=$(${bin_path} -v 2>/dev/null | grep -oE "v[0-9]+(\.[0-9]+)+" | head -1 | sed 's/^v//')
+      output=$(${bin_path} -v 2>/dev/null)
+      version=$(echo "$output" | grep -oE "(alpha|beta|rc)-[0-9a-f]+" | head -1)
+      if [ -z "$version" ]; then
+        version=$(echo "$output" | grep -oE "v[0-9]+(\.[0-9]+)+" | head -1 | sed 's/^v//')
+      fi
       echo "ClashMeta/${version}"
       ;;
     sing-box)
-      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      output=$(${bin_path} version 2>/dev/null)
+      version=$(echo "$output" \
+        | grep -oE "sing-box version [^ ]+" \
+        | awk '{print $3}')
       echo "sing-box/${version}"
       ;;
     xray)
-      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      version=$(${bin_path} version 2>/dev/null \
+        | grep -oE "Xray [0-9]+(\.[0-9]+)+" \
+        | awk '{print $2}' | head -1)
       echo "Xray/${version}"
       ;;
     v2fly)
-      version=$(${bin_path} version 2>/dev/null | grep -oE "[0-9]+(\.[0-9]+)+" | head -1)
+      version=$(${bin_path} version 2>/dev/null \
+        | grep -oE "v[0-9]+(\.[0-9]+)+" \
+        | head -1 | sed 's/^v//')
       echo "v2fly/${version}"
       ;;
     *)
@@ -527,6 +538,7 @@ get_core_ua() {
       ;;
   esac
 }
+
 
 # 检查并更新订阅
 upsubs() {
