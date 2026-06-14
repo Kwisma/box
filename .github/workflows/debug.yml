@@ -2,16 +2,20 @@ name: debug
 
 on:
   workflow_dispatch:
-  push:
-    paths-ignore:
-      - "README.md"
-      - "CHANGELOG.md"
-    branches:
-      - master
+    inputs:
+      version:
+        description: '预发布版本号'
+        required: true
+        type: string
 
 jobs:
   build:
+    if: github.ref_name == 'test'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      artifact_name: ${{ steps.get_version.outputs.artifact_name }}
+      latest_release_tag: ${{ steps.get_version.outputs.latest_release_tag }}
 
     steps:
       - uses: actions/checkout@v4.1.0
@@ -21,16 +25,26 @@ jobs:
       - name: Update Module.prop
         run: |
           dos2unix module.prop || true
-          
-          VERSION=$(grep -oP 'version=\K[^ ]+' module.prop | tr -d '\r')
-          sed -i "s/$VERSION/$VERSION($(git log --oneline -n 1 | awk '{print $1}'))/g" module.prop
+
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION=$(printf "%s" "$VERSION" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [ -z "$VERSION" ]; then
+            echo "version 不能为空"
+            exit 1
+          fi
+
+          COMMIT_HASH=$(git log --oneline -n 1 | awk '{print $1}')
+          sed -i "s/^version=.*/version=${VERSION}(${COMMIT_HASH})/g" module.prop
           sed -i "s/versionCode=.*/versionCode=$(date +%Y%m%d)/g" module.prop
 
       - name: Get Version
         id: get_version
         run: |
           VERSION=$(grep -oP 'version=\K[^ ]+' module.prop | tr -d '\r')
+          LATEST_RELEASE_TAG=$(git tag -l --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=box_$VERSION" >> "$GITHUB_OUTPUT"
+          echo "latest_release_tag=$LATEST_RELEASE_TAG" >> "$GITHUB_OUTPUT"
         
       - name: Generate Asset
         run: |
@@ -59,21 +73,40 @@ jobs:
       - name: Get Version Info
         id: get_version
         run: |
-          VERSION=$(grep -oP 'version=\K[^ ]+' module.prop | tr -d '\r')
+          VERSION="${{ needs.build.outputs.version }}"
           COMMIT_HASH=$(git log -1 --pretty=format:"%h")
           COMMIT_DATE=$(git log -1 --pretty=format:"%ad" --date=short)
           COMMIT_MSG=$(git log -1 --pretty=format:"%B")
-          FULL_VERSION="${VERSION}(${COMMIT_HASH})"
-          ARTIFACT_NAME="box_${FULL_VERSION}"
+          LATEST_RELEASE_TAG="${{ needs.build.outputs.latest_release_tag }}"
+          ARTIFACT_NAME="${{ needs.build.outputs.artifact_name }}"
+
+          if [ -n "$LATEST_RELEASE_TAG" ]; then
+            CHANGELOG_TITLE="自 $LATEST_RELEASE_TAG 以来的变更"
+            CHANGELOG_BODY=$(git log "$LATEST_RELEASE_TAG..HEAD" --pretty=format:'- %s (%h)' --no-merges)
+          else
+            CHANGELOG_TITLE="最近变更"
+            CHANGELOG_BODY=$(git log -n 20 --pretty=format:'- %s (%h)' --no-merges)
+          fi
+
+          if [ -z "$CHANGELOG_BODY" ]; then
+            CHANGELOG_BODY="- 暂无新的提交"
+          fi
           
-          echo "version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
           echo "commit_hash=$COMMIT_HASH" >> "$GITHUB_OUTPUT"
           echo "commit_date=$COMMIT_DATE" >> "$GITHUB_OUTPUT"
+          echo "changelog_title=$CHANGELOG_TITLE" >> "$GITHUB_OUTPUT"
           
           {
             echo 'commit_msg<<EOF'
             echo "$COMMIT_MSG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'changelog_body<<EOF'
+            echo "$CHANGELOG_BODY"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -117,6 +150,16 @@ jobs:
             **提交:** ${{ steps.get_version.outputs.commit_hash }}
             **日期:** ${{ steps.get_version.outputs.commit_date }}
             
+            ### 更新日志
+            <details>
+            <summary>${{ steps.get_version.outputs.changelog_title }}</summary>
+
+            ```text
+            ${{ steps.get_version.outputs.changelog_body }}
+            ```
+
+            </details>
+
             ### 提交信息
             ${{ steps.get_version.outputs.commit_msg }}
             
@@ -131,6 +174,7 @@ jobs:
     permissions:
       contents: read
     needs:
+      - build
       - prerelease
     if: success()
     steps:
@@ -141,25 +185,46 @@ jobs:
       - name: Get Version Info
         id: get_version
         run: |
-          VERSION=$(grep -oP 'version=\K[^ ]+' module.prop | tr -d '\r')
+          VERSION="${{ needs.build.outputs.version }}"
           COMMIT_HASH=$(git log -1 --pretty=format:"%h")
           COMMIT_DATE=$(git log -1 --pretty=format:"%ad" --date=short)
+          LATEST_RELEASE_TAG="${{ needs.build.outputs.latest_release_tag }}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "commit_hash=$COMMIT_HASH" >> "$GITHUB_OUTPUT"
           echo "commit_date=$COMMIT_DATE" >> "$GITHUB_OUTPUT"
           echo "tag_name=debug" >> "$GITHUB_OUTPUT"
+          echo "latest_release_tag=$LATEST_RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Get Commit Message
         id: commit_info
         run: |
           COMMIT_MSG=$(git log -1 --pretty=format:"%B")
-          # Escape HTML special characters for Telegram HTML parse mode
-          # Convert backticks to <code> tags for better Telegram display
-          COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/`\([^`]*\)`/<code>\1<\/code>/g')
+          LATEST_RELEASE_TAG="${{ steps.get_version.outputs.latest_release_tag }}"
+          if [ -n "$LATEST_RELEASE_TAG" ]; then
+            CHANGELOG_BODY=$(git log "$LATEST_RELEASE_TAG..HEAD" -n 10 --pretty=format:'- %s (%h)' --no-merges)
+          else
+            CHANGELOG_BODY=$(git log -n 10 --pretty=format:'- %s (%h)' --no-merges)
+          fi
+          if [ -z "$CHANGELOG_BODY" ]; then
+            CHANGELOG_BODY="- 暂无新的提交"
+          fi
+
+          escape_md_v2_code() {
+            perl -pe 's/([`\\])/\\$1/g'
+          }
+
+          COMMIT_MSG_ESCAPED=$(printf "%s" "$COMMIT_MSG" | escape_md_v2_code)
+          CHANGELOG_ESCAPED=$(printf "%s" "$CHANGELOG_BODY" | escape_md_v2_code)
           
           {
             echo 'commit_msg<<EOF'
             echo "$COMMIT_MSG_ESCAPED"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'changelog_body<<EOF'
+            echo "$CHANGELOG_ESCAPED"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -189,20 +254,50 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+          COMMIT_HASH: ${{ steps.get_version.outputs.commit_hash }}
+          COMMIT_DATE: ${{ steps.get_version.outputs.commit_date }}
+          CHANGELOG_BODY: ${{ steps.commit_info.outputs.changelog_body }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.tag_name }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
         run: |
-          MESSAGE="📦 <b>Box 模块自动构建</b>
-          
-          <b>版本:</b> ${{ steps.get_version.outputs.version }}
-          <b>提交:</b> <code>${{ steps.get_version.outputs.commit_hash }}</code>
-          <b>日期:</b> ${{ steps.get_version.outputs.commit_date }}
-          <b>内容:</b> ${{ steps.commit_info.outputs.commit_msg }}
-          
-          <a href='https://github.com/${{ github.repository }}'>仓库地址</a> | <a href='https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.tag_name }}'>Release 详情</a>
+          escape_md_v2() {
+            perl -pe 's/([_*\[\]()~`>#+\-=|{}.!\\])/\\$1/g'
+          }
 
-          #模块更新"
+          escape_md_v2_code() {
+            perl -pe 's/([`\\])/\\$1/g'
+          }
+
+          escape_md_v2_url() {
+            perl -pe 's/([)\\])/\\$1/g'
+          }
+
+          VERSION_ESCAPED=$(printf "%s" "$VERSION" | escape_md_v2)
+          COMMIT_HASH_ESCAPED=$(printf "%s" "$COMMIT_HASH" | escape_md_v2_code)
+          COMMIT_DATE_ESCAPED=$(printf "%s" "$COMMIT_DATE" | escape_md_v2)
+          REPOSITORY_URL_ESCAPED=$(printf "%s" "$REPOSITORY_URL" | escape_md_v2_url)
+          RELEASE_URL_ESCAPED=$(printf "%s" "$RELEASE_URL" | escape_md_v2_url)
+
+          MESSAGE=$(cat <<EOF
+          📦 *Box 模块自动构建*
+
+          *版本:* $VERSION_ESCAPED
+          *提交:* \`$COMMIT_HASH_ESCAPED\`
+          *日期:* $COMMIT_DATE_ESCAPED
+          *更新日志:*
+          \`\`\`
+          $CHANGELOG_BODY
+          \`\`\`
+
+          [仓库地址]($REPOSITORY_URL_ESCAPED) \| [Release 详情]($RELEASE_URL_ESCAPED)
+
+          \#模块更新
+          EOF
+          )
 
           curl -sS -f -F "chat_id=$TG_CHAT_ID" \
                -F "document=@${{ steps.download_asset.outputs.asset_name }}" \
                -F "caption=$MESSAGE" \
-               -F "parse_mode=HTML" \
+               -F "parse_mode=MarkdownV2" \
                "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument"

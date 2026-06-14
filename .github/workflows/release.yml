@@ -4,24 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '发布标签'
-        required: true
-      branch:
-        description: '目标分支（用于版本文件更新）'
+        description: '正式版本号'
         required: true
       changelog:
-        description: '更新日志内容 (用 | 分隔多个项目)'
-        required: true
+        description: '发布更新日志（留空则自动从 commits 生成，手动填写可用 | 分隔）'
+        required: false
         type: string
 
 jobs:
   build:
+    if: github.ref_name == 'master'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release_info.outputs.version }}
+      tag_name: ${{ steps.release_info.outputs.tag_name }}
+      commit_hash: ${{ steps.release_info.outputs.commit_hash }}
+      commit_date: ${{ steps.release_info.outputs.commit_date }}
+      changelog_title: ${{ steps.changelog.outputs.title }}
+      changelog_body: ${{ steps.changelog.outputs.body }}
 
     steps:
       # 1. Checkout repository
       - uses: actions/checkout@v4
         with:
+          ref: master
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -30,13 +38,51 @@ jobs:
         id: get_version
         run: echo "date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      # 3. Update update.json, module.prop, and CHANGELOG.md
+      # 3. Generate changelog
+      - name: Generate changelog
+        id: changelog
+        env:
+          INPUT_CHANGELOG: ${{ github.event.inputs.changelog }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$(printf "%s" "$INPUT_CHANGELOG" | tr -d '[:space:]')" ]; then
+            CHANGELOG_BODY=$(printf "%s\n" "$INPUT_CHANGELOG" | tr '|' '\n' | while IFS= read -r line; do
+              trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              if [ -n "$trimmed_line" ]; then
+                echo "- $trimmed_line"
+              fi
+            done)
+            CHANGELOG_TITLE="手动更新日志"
+          else
+            PREVIOUS_TAG=$(git tag -l --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | grep -v -x "$RELEASE_TAG" | head -n 1)
+            if [ -n "$PREVIOUS_TAG" ]; then
+              CHANGELOG_BODY=$(git log "$PREVIOUS_TAG..HEAD" --pretty=format:'- %s (%h)' --no-merges)
+              CHANGELOG_TITLE="自 $PREVIOUS_TAG 以来的变更"
+            else
+              CHANGELOG_BODY=$(git log -n 50 --pretty=format:'- %s (%h)' --no-merges)
+              CHANGELOG_TITLE="最近变更"
+            fi
+          fi
+
+          if [ -z "$CHANGELOG_BODY" ]; then
+            CHANGELOG_BODY="- 暂无新的提交"
+          fi
+
+          echo "title=$CHANGELOG_TITLE" >> "$GITHUB_OUTPUT"
+          {
+            echo 'body<<EOF'
+            echo "$CHANGELOG_BODY"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # 4. Update update.json, module.prop, and CHANGELOG.md
       - name: Update files
+        env:
+          RELEASE_CHANGELOG: ${{ steps.changelog.outputs.body }}
         run: |
           VERSION="${{ github.event.inputs.tag }}"
           DATE_NUM="${{ steps.get_version.outputs.date }}"
           DATE_HUMAN=$(date +%d-%m-%Y)
-          CHANGELOG="${{ github.event.inputs.changelog }}"
           dos2unix module.prop || true
 
           # update.json
@@ -61,29 +107,10 @@ jobs:
           
           {
             echo "#### Changelog $VERSION - $DATE_HUMAN"
-            echo "$CHANGELOG" | tr '|' '\n' | while IFS= read -r line; do
-              trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-              if [ -n "$trimmed_line" ]; then
-                echo "- $trimmed_line"
-              fi
-            done
+            printf "%s\n" "$RELEASE_CHANGELOG"
             echo ""
             cat CHANGELOG.md
           } > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
-
-      # 4. Format changelog for GitHub Release
-      - name: Format changelog for release
-        id: format_changelog
-        run: |
-          FORMATTED=$(echo "${{ github.event.inputs.changelog }}" | tr '|' '\n' | while IFS= read -r line; do
-            trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [ -n "$trimmed_line" ]; then
-              echo "- $trimmed_line"
-            fi
-          done)
-          echo "formatted_changelog<<EOF" >> $GITHUB_OUTPUT
-          echo "$FORMATTED" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
       # 5. Commit and push changes
       - name: Commit and push changes
@@ -92,23 +119,165 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add update.json module.prop CHANGELOG.md
           git commit -m "${{ github.event.inputs.tag }}" || echo "No changes to commit"
-          git push https://github-actions:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.event.inputs.branch }} --force
+          git push https://github-actions:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:master
 
-      # 6. Run build script
+      # 6. Get release info
+      - name: Get Release Info
+        id: release_info
+        run: |
+          VERSION="${{ github.event.inputs.tag }}"
+          COMMIT_HASH=$(git log -1 --pretty=format:"%h")
+          COMMIT_DATE=$(git log -1 --pretty=format:"%ad" --date=short)
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit_hash=$COMMIT_HASH" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$COMMIT_DATE" >> "$GITHUB_OUTPUT"
+
+      # 7. Run build script
       - name: Run build.sh
         run: |
           chmod +x build.sh
           ./build.sh
 
-      # 7. Create GitHub Release
+      # 8. Create GitHub Release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.event.inputs.tag }}
           files: box-*.zip
-          generate_release_notes: true
           body: |
             #### Changelog ${{ github.event.inputs.tag }}
-            
-            ${{ steps.format_changelog.outputs.formatted_changelog }}
 
+            ${{ steps.changelog.outputs.title }}
+
+            ${{ steps.changelog.outputs.body }}
+
+  telegram-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - build
+    if: success()
+    steps:
+      - uses: actions/checkout@v4.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Telegram Message
+        id: telegram_message
+        env:
+          CHANGELOG_BODY: ${{ needs.build.outputs.changelog_body }}
+        run: |
+          CHANGELOG_SUMMARY=$(printf "%s" "$CHANGELOG_BODY" | awk '
+            BEGIN {
+              max_chars = 650
+              max_lines = 12
+              used = 0
+            }
+            NR > max_lines {
+              print "- 更多内容请查看 Release 详情"
+              exit
+            }
+            {
+              extra = length($0) + 1
+              if (used + extra > max_chars) {
+                print "- 更多内容请查看 Release 详情"
+                exit
+              }
+              print
+              used += extra
+            }
+          ')
+
+          escape_md_v2_code() {
+            perl -pe 's/([`\\])/\\$1/g'
+          }
+
+          CHANGELOG_ESCAPED=$(printf "%s" "$CHANGELOG_SUMMARY" | escape_md_v2_code)
+
+          {
+            echo 'changelog_body<<EOF'
+            echo "$CHANGELOG_ESCAPED"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download Release Asset
+        id: download_asset
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.build.outputs.tag_name }}
+        run: |
+          RELEASE_INFO=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG_NAME")
+
+          DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' | head -n 1)
+          ASSET_NAME=$(echo "$RELEASE_INFO" | jq -r '.assets[] | select(.name | endswith(".zip")) | .name' | head -n 1)
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "Release asset not found for tag: $TAG_NAME"
+            exit 1
+          fi
+
+          curl -sL -o "$ASSET_NAME" "$DOWNLOAD_URL"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Send to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT_HASH: ${{ needs.build.outputs.commit_hash }}
+          COMMIT_DATE: ${{ needs.build.outputs.commit_date }}
+          CHANGELOG_TITLE: ${{ needs.build.outputs.changelog_title }}
+          CHANGELOG_BODY: ${{ steps.telegram_message.outputs.changelog_body }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.build.outputs.tag_name }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "TG_BOT_TOKEN and TG_CHAT_ID are required"
+            exit 1
+          fi
+
+          escape_md_v2() {
+            perl -pe 's/([_*\[\]()~`>#+\-=|{}.!\\])/\\$1/g'
+          }
+
+          escape_md_v2_code() {
+            perl -pe 's/([`\\])/\\$1/g'
+          }
+
+          escape_md_v2_url() {
+            perl -pe 's/([)\\])/\\$1/g'
+          }
+
+          VERSION_ESCAPED=$(printf "%s" "$VERSION" | escape_md_v2)
+          COMMIT_HASH_ESCAPED=$(printf "%s" "$COMMIT_HASH" | escape_md_v2_code)
+          COMMIT_DATE_ESCAPED=$(printf "%s" "$COMMIT_DATE" | escape_md_v2)
+          CHANGELOG_TITLE_ESCAPED=$(printf "%s" "$CHANGELOG_TITLE" | escape_md_v2)
+          REPOSITORY_URL_ESCAPED=$(printf "%s" "$REPOSITORY_URL" | escape_md_v2_url)
+          RELEASE_URL_ESCAPED=$(printf "%s" "$RELEASE_URL" | escape_md_v2_url)
+
+          MESSAGE=$(cat <<EOF
+          🚀 *Box 正式版发布*
+
+          *版本:* $VERSION_ESCAPED
+          *提交:* \`$COMMIT_HASH_ESCAPED\`
+          *日期:* $COMMIT_DATE_ESCAPED
+          *更新日志:* $CHANGELOG_TITLE_ESCAPED
+          \`\`\`
+          $CHANGELOG_BODY
+          \`\`\`
+
+          [仓库地址]($REPOSITORY_URL_ESCAPED) \| [Release 详情]($RELEASE_URL_ESCAPED)
+
+          \#模块更新
+          EOF
+          )
+
+          curl -sS -f -F "chat_id=$TG_CHAT_ID" \
+               -F "document=@${{ steps.download_asset.outputs.asset_name }}" \
+               -F "caption=$MESSAGE" \
+               -F "parse_mode=MarkdownV2" \
+               "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument"

@@ -35,8 +35,7 @@ mask_url() {
 
 # 启动提示
 divider() {
-  local line="----------------------------------------"
-  [ -n "$box_log" ] && echo "$line" >> "$box_log"
+  [ -n "$box_log" ] && log Info "----------------------------------------" >/dev/null
 }
 trap divider EXIT
 log Info "执行命令: $0 $@"
@@ -106,17 +105,83 @@ upfile() {
 }
 
 # CN IPv4/IPv6 列表更新
+is_box_running() {
+  [ -f "${box_pid}" ] && kill -0 "$(<"${box_pid}" 2>/dev/null)" 2>/dev/null
+}
+
+reload_cnip_set() {
+  local set_name="$1"
+  local family="$2"
+  local source_file="$3"
+  local entries=0
+
+  if [ ! -s "${source_file}" ]; then
+    log Error "${set_name} 重写入失败: 文件不存在或为空"
+    return 1
+  fi
+
+  if ! command -v ipset >/dev/null 2>&1; then
+    log Warning "ipset 不可用，跳过 ${set_name} 重写入"
+    return 1
+  fi
+
+  entries="$(busybox awk '!/^[[:space:]]*#/ && NF > 0 {count++} END {print count + 0}' "${source_file}" 2>/dev/null)"
+  log Info "正在重写入 ${set_name}，条目=${entries}"
+
+  if {
+    echo "create ${set_name} hash:net family ${family} hashsize 8192 maxelem 65536 -exist"
+    echo "flush ${set_name}"
+    busybox awk -v set="${set_name}" '!/^[[:space:]]*#/ && NF > 0 {printf "add %s %s\n", set, $0}' "${source_file}"
+  } | ipset restore -exist 2>/dev/null; then
+    log Info "${set_name} 重写入完成"
+    return 0
+  fi
+
+  log Error "${set_name} 重写入失败"
+  return 1
+}
+
+reload_cnip_sets_after_update() {
+  local updated_v4="$1"
+  local updated_v6="$2"
+  local ok="true"
+
+  [ "${bypass_cn_ip}" = "true" ] || return 0
+  is_box_running || return 0
+
+  if [ "${updated_v4}" = "true" ] || [ "${updated_v6}" = "true" ]; then
+    log Info "服务运行中且已启用 CNIP，正在重写入 ipset"
+  fi
+
+  if [ "${updated_v4}" = "true" ]; then
+    reload_cnip_set cnip inet "${cn_ip_file}" || ok="false"
+  fi
+
+  if [ "${updated_v6}" = "true" ]; then
+    reload_cnip_set cnip6 inet6 "${cn_ipv6_file}" || ok="false"
+  fi
+
+  [ "${ok}" = "true" ]
+}
+
 upcnip() {
-  local did_any=false
+  local attempted=0
+  local success=0
+  local updated_v4="false"
+  local updated_v6="false"
+
   # IPv4
   if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ]; then
     if [ -z "${cn_ip_url}" ] || [ -z "${cn_ip_file}" ]; then
       log Warning "cn_ip_url 或 cn_ip_file 未配置，跳过 IPv4"
     else
+      attempted=$((attempted + 1))
+      busybox mkdir -p "$(dirname "${cn_ip_file}")" >/dev/null 2>&1 || true
       log Info "下载 CN IPv4 列表 → ${cn_ip_file}"
       if upfile "${cn_ip_file}" "${cn_ip_url}"; then
         log Info "CN IPv4 列表更新完成"
-        did_any=true
+        success=$((success + 1))
+        updated_v4="true"
       else
         log Error "CN IPv4 列表更新失败"
       fi
@@ -130,10 +195,13 @@ upcnip() {
     if [ -z "${cn_ipv6_url}" ] || [ -z "${cn_ipv6_file}" ]; then
       log Warning "cn_ipv6_url 或 cn_ipv6_file 未配置，跳过 IPv6"
     else
+      attempted=$((attempted + 1))
+      busybox mkdir -p "$(dirname "${cn_ipv6_file}")" >/dev/null 2>&1 || true
       log Info "下载 CN IPv6 列表 → ${cn_ipv6_file}"
       if upfile "${cn_ipv6_file}" "${cn_ipv6_url}"; then
         log Info "CN IPv6 列表更新完成"
-        did_any=true
+        success=$((success + 1))
+        updated_v6="true"
       else
         log Error "CN IPv6 列表更新失败"
       fi
@@ -142,7 +210,23 @@ upcnip() {
     log Debug "未启用 IPv6 CN 分流或未开启 IPv6，跳过下载"
   fi
 
-  $did_any && return 0 || return 1
+  if [ "${attempted}" -eq 0 ]; then
+    log Info "未启用 CNIP 更新项，已跳过"
+    return 0
+  fi
+
+  if [ "${success}" -ne "${attempted}" ]; then
+    log Error "CNIP 列表更新异常（成功 ${success}/${attempted}）"
+    return 1
+  fi
+
+  if ! reload_cnip_sets_after_update "${updated_v4}" "${updated_v6}"; then
+    log Error "CNIP ipset 重写入失败"
+    return 1
+  fi
+
+  log Info "CNIP 列表更新完成（成功 ${success}/${attempted}）"
+  return 0
 }
 
 # 重启核心进程

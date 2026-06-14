@@ -2,62 +2,85 @@
 
 # 检查模块是否已禁用
 if [ -f "/data/adb/modules/box_for_root/disable" ]; then
-    exit 0
+  exit 0
 fi
 
-events=$1
-# monitor_dir=$2
-# monitor_file=$3
+events="$1"
+# monitor_dir="$2"
+# monitor_file="$3"
 
-export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/system/bin"
+export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/system/bin:/data/data/com.termux/files/usr/bin"
+
+BASE_DIR="/data/adb/box"
+case "$0" in
+  */*)
+    SCRIPTS_DIR="${0%/*}"
+    ;;
+  *)
+    SCRIPTS_DIR="${BASE_DIR}/scripts"
+    ;;
+esac
+LOG_DIR="${BASE_DIR}/run"
+STATE_DIR="${BASE_DIR}/run/state"
+BOX_PID_FILE="${BASE_DIR}/run/box.pid"
+
+NET_LOG_FILE="${LOG_DIR}/net.log"
+
+CTRL_LOG_FILE="${LOG_DIR}/netswitch.log"
+CTRL_STATE_FILE="${STATE_DIR}/last_check_time"
+CTRL_WIFI_STATE_FILE="${STATE_DIR}/last_wifi_state"
+CTRL_STABILITY_WINDOW=3
 
 # ex: 7.1.1
 buildVersion=$(getprop ro.build.version.release)
 minBuildVersion="11"
-IPV="iptables" # Default
-IP6V="ip6tables" # Default
-# ex: 7.1.1 -> 7
+IPV="iptables"
+IP6V="ip6tables"
 buildVersionMajor=${buildVersion%%.*}
-if [ "$buildVersionMajor" -ge "$minBuildVersion" ]; then
+if [ "${buildVersionMajor}" -ge "${minBuildVersion}" ]; then
   IPV="iptables -w 100"
   IP6V="ip6tables -w 100"
 fi
 
 iptables="${IPV}"
 ip6tables="${IP6V}"
-logs="/data/adb/box/run"
-log_file="${logs}/net.log"
-lock_dir="${logs}/locks/net_inotify.lock"
 
-log_info() {
-  mkdir -p "${logs}" >/dev/null 2>&1 || true
-  echo "[$(date '+%F %T')] [Info]: $*" >> "${log_file}" 2>&1
+ensure_dirs() {
+  mkdir -p "${LOG_DIR}" "${STATE_DIR}" >/dev/null 2>&1 || true
 }
 
-log_warn() {
-  mkdir -p "${logs}" >/dev/null 2>&1 || true
-  echo "[$(date '+%F %T')] [Warn]: $*" >> "${log_file}" 2>&1
+net_log_info() {
+  local previous_box_log="${box_log}"
+  box_log="${NET_LOG_FILE}"
+  log Info "$*" >/dev/null
+  box_log="${previous_box_log}"
 }
 
-log_reset() {
-  mkdir -p "${logs}" >/dev/null 2>&1 || true
-  : > "${log_file}" 2>&1 || true
+net_log_warn() {
+  local previous_box_log="${box_log}"
+  box_log="${NET_LOG_FILE}"
+  log Warn "$*" >/dev/null
+  box_log="${previous_box_log}"
 }
 
-with_lock_or_skip() {
-  mkdir -p "${logs}" "${logs}/locks" >/dev/null 2>&1 || true
-  if ! mkdir "${lock_dir}" >/dev/null 2>&1; then
-    return 1
-  fi
-  trap "rmdir \"${lock_dir}\" >/dev/null 2>&1 || true" EXIT INT TERM
-  return 0
+net_log_debug() {
+  local previous_box_log="${box_log}"
+  box_log="${NET_LOG_FILE}"
+  log Debug "$*" >/dev/null
+  box_log="${previous_box_log}"
 }
 
-chain_exists() {
-  local ipt_cmd="$1"
-  local table_name="$2"
-  local chain_name="$3"
-  ${ipt_cmd} -t "${table_name}" -L "${chain_name}" >/dev/null 2>&1
+reset_event_logs() {
+  ensure_dirs
+  : > "${NET_LOG_FILE}" 2>/dev/null || true
+}
+
+control_log_msg() {
+  [ "${inotify_log_enabled}" = "true" ] || return 0
+  local previous_box_log="${box_log}"
+  box_log="${CTRL_LOG_FILE}"
+  log Info "$*" >/dev/null
+  box_log="${previous_box_log}"
 }
 
 ensure_chain_and_flush() {
@@ -68,56 +91,267 @@ ensure_chain_and_flush() {
   ${ipt_cmd} -t "${table_name}" -F "${chain_name}" >/dev/null 2>&1 || true
 }
 
-ensure_rule_append() {
+append_rule_fast() {
   local ipt_cmd="$1"
   local table_name="$2"
   local chain_name="$3"
   shift 3
-  if ${ipt_cmd} -t "${table_name}" -C "${chain_name}" "$@" >/dev/null 2>&1; then
-    return 0
-  fi
   ${ipt_cmd} -t "${table_name}" -A "${chain_name}" "$@" >/dev/null 2>&1
 }
 
-rules_add() {
-  mkdir -p "${logs}" >/dev/null 2>&1 || true
-
-  ensure_chain_and_flush "${iptables}" mangle LOCAL_IP_V4
-  ensure_chain_and_flush "${iptables}" nat LOCAL_IP_V4
-
-  ip -4 a | busybox awk '/inet/ {print $2}' | busybox sort -u | busybox grep -vE "^127\\.0\\.0\\.1" | while read -r local_ipv4 ; do
-    rv1=1
-    rv2=1
-    ensure_rule_append "${iptables}" mangle LOCAL_IP_V4 -d "${local_ipv4}" -j ACCEPT
-    rv1=$?
-    ensure_rule_append "${iptables}" nat LOCAL_IP_V4 -d "${local_ipv4}" -j ACCEPT
-    rv2=$?
-    if [ "${rv1}" = "0" ] || [ "${rv2}" = "0" ]; then
-      log_info "本地IP ${local_ipv4}，防环回规则已更新"
-    else
-      log_warn "本地IP ${local_ipv4}，防环回规则更新失败"
-    fi
-  done
-
-  ensure_chain_and_flush "${ip6tables}" mangle LOCAL_IP_V6
-  ip -6 a | busybox awk '/inet6/ {print $2}' | busybox sort -u | busybox grep -vE "^fe80|^::1|^fd00" | while read -r local_ipv6 ; do
-    rv6=1
-    ensure_rule_append "${ip6tables}" mangle LOCAL_IP_V6 -d "${local_ipv6}" -j ACCEPT
-    rv6=$?
-    if [ "${rv6}" = "0" ]; then
-      log_info "本地IP ${local_ipv6}，防环回规则已更新"
-    else
-      log_warn "本地IP ${local_ipv6}，防环回规则更新失败"
-    fi
-  done
+mode_needs_local_ip_mangle() {
+  case "${network_mode}" in
+    tproxy|enhance)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
-if [ "$events" = "w" ]; then
-  # 只有 box.pid 存在时才执行原有规则
-  if [ -f "/data/adb/box/run/box.pid" ]; then
-    if with_lock_or_skip; then
-      log_reset
-      rules_add
-    fi
+mode_needs_local_ip_nat() {
+  case "${network_mode}" in
+    redirect|mixed|enhance)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_local_ip_ruleset() {
+  local ipt_cmd="$1"
+  local table_name="$2"
+  local chain_name="$3"
+  local local_ip="$4"
+
+  append_rule_fast "${ipt_cmd}" "${table_name}" "${chain_name}" -d "${local_ip}" -p udp ! --dport 53 -j ACCEPT
+  local rv1=$?
+  append_rule_fast "${ipt_cmd}" "${table_name}" "${chain_name}" -d "${local_ip}" ! -p udp -j ACCEPT
+  local rv2=$?
+
+  if [ "${rv1}" = "0" ] || [ "${rv2}" = "0" ]; then
+    return 0
   fi
+  return 1
+}
+
+collect_local_ipv4_list() {
+  ip -o -4 addr show up 2>/dev/null \
+    | busybox awk '{print $4}' \
+    | busybox sort -u \
+    | busybox grep -vE '^127\.0\.0\.1$'
+}
+
+collect_local_ipv6_list() {
+  ip -o -6 addr show up scope global 2>/dev/null \
+    | busybox awk '{print $4}' \
+    | busybox sort -u \
+    | busybox grep -vE '^fd00'
+}
+
+update_local_ip_rules() {
+  local v4_ok=0
+  local v4_fail=0
+  local v6_ok=0
+  local v6_fail=0
+  local need_mangle="false"
+  local need_nat="false"
+  local local_ipv4=""
+  local local_ipv6=""
+  local ok=""
+
+  if mode_needs_local_ip_mangle; then
+    need_mangle="true"
+  fi
+  if mode_needs_local_ip_nat; then
+    need_nat="true"
+  fi
+
+  if [ "${need_mangle}" != "true" ] && [ "${need_nat}" != "true" ]; then
+    net_log_debug "当前模式无需更新本地 IP 防回环规则"
+    return 0
+  fi
+
+  if [ "${need_mangle}" = "true" ]; then
+    net_log_debug "开始更新本地 IPv4 防回环规则"
+    ensure_chain_and_flush "${iptables}" mangle LOCAL_IP_V4
+  fi
+  if [ "${need_nat}" = "true" ]; then
+    ensure_chain_and_flush "${iptables}" nat LOCAL_IP_V4
+  fi
+
+  for local_ipv4 in $(collect_local_ipv4_list); do
+    ok="true"
+
+    if [ "${need_mangle}" = "true" ]; then
+      append_local_ip_ruleset "${iptables}" mangle LOCAL_IP_V4 "${local_ipv4}" || ok="false"
+    fi
+    if [ "${need_nat}" = "true" ]; then
+      append_local_ip_ruleset "${iptables}" nat LOCAL_IP_V4 "${local_ipv4}" || ok="false"
+    fi
+
+    if [ "${ok}" = "true" ]; then
+      v4_ok=$((v4_ok + 1))
+      net_log_debug "本地 IPv4 ${local_ipv4} 防回环规则已更新"
+    else
+      v4_fail=$((v4_fail + 1))
+      net_log_warn "本地 IPv4 ${local_ipv4} 防回环规则更新失败"
+    fi
+  done
+
+  if [ $((v4_ok + v4_fail)) -eq 0 ]; then
+    net_log_debug "未检测到需要写入的本地 IPv4 地址"
+  fi
+
+  if [ "${need_mangle}" = "true" ]; then
+    net_log_debug "开始更新本地 IPv6 防回环规则"
+    ensure_chain_and_flush "${ip6tables}" mangle LOCAL_IP_V6
+  fi
+
+  for local_ipv6 in $(collect_local_ipv6_list); do
+    ok="true"
+
+    if [ "${need_mangle}" = "true" ]; then
+      append_local_ip_ruleset "${ip6tables}" mangle LOCAL_IP_V6 "${local_ipv6}" || ok="false"
+    fi
+
+    if [ "${ok}" = "true" ]; then
+      v6_ok=$((v6_ok + 1))
+      net_log_debug "本地 IPv6 ${local_ipv6} 防回环规则已更新"
+    else
+      v6_fail=$((v6_fail + 1))
+      net_log_warn "本地 IPv6 ${local_ipv6} 防回环规则更新失败"
+    fi
+  done
+
+  if [ $((v6_ok + v6_fail)) -eq 0 ]; then
+    net_log_debug "未检测到需要写入的本地 IPv6 地址"
+  fi
+
+  net_log_info "防回环规则更新完成: IPv4 成功=${v4_ok} 失败=${v4_fail}, IPv6 成功=${v6_ok} 失败=${v6_fail}"
+}
+
+check_stability_window() {
+  local current
+  local last=0
+
+  current=$(date +%s)
+  [ -f "${CTRL_STATE_FILE}" ] && last=$(cat "${CTRL_STATE_FILE}" 2>/dev/null || echo 0)
+
+  if [ $((current - last)) -lt ${CTRL_STABILITY_WINDOW} ]; then
+    control_log_msg "跳过：处于稳定窗口冷却期（$((current - last))秒）"
+    return 1
+  fi
+
+  echo "${current}" > "${CTRL_STATE_FILE}"
+  return 0
+}
+
+is_service_running() {
+  [ -f "${BOX_PID_FILE}" ] && kill -0 "$(cat "${BOX_PID_FILE}" 2>/dev/null)" 2>/dev/null
+}
+
+start_service_if_needed() {
+  if is_service_running; then
+    control_log_msg "[跳过] 服务已在运行"
+    return 0
+  fi
+
+  "${SCRIPTS_DIR}/box.service" start
+  "${SCRIPTS_DIR}/box.iptables" enable
+  control_log_msg "[启动] 服务已启动"
+}
+
+stop_service_if_needed() {
+  if ! is_service_running; then
+    control_log_msg "[跳过] 服务已停止"
+    return 0
+  fi
+
+  "${SCRIPTS_DIR}/box.iptables" disable
+  "${SCRIPTS_DIR}/box.service" stop
+  control_log_msg "[停止] 服务已停止"
+}
+
+save_wifi_state() {
+  local ssid="$1"
+  local bssid="$2"
+  local ip="$3"
+
+  cat > "${CTRL_WIFI_STATE_FILE}" <<-EOF
+ssid:${ssid}
+bssid:${bssid}
+ip:${ip}
+EOF
+}
+
+apply_network_control_policy() {
+  [ "${enable_network_service_control}" = "true" ] || return 0
+
+  if [ ! -f "${SCRIPTS_DIR}/ctr.utils" ]; then
+    control_log_msg "警告：未找到 ctr.utils，跳过网络策略控制"
+    return 0
+  fi
+
+  . "${SCRIPTS_DIR}/ctr.utils"
+  check_stability_window || return 0
+
+  local wifi_status
+  local ssid
+  local bssid
+  local wifi_ip=""
+  local i
+
+  wifi_status=$(is_wifi_connected)
+  ssid=$(get_current_ssid)
+  bssid=$(get_current_bssid)
+
+  control_log_msg "--- 网络状态检查 ---"
+
+  if [ "${wifi_status}" = "wifi" ]; then
+    for i in 1 2 3; do
+      wifi_ip=$(get_wifi_ip)
+      [ -n "${wifi_ip}" ] && break
+      sleep 1
+    done
+
+    if [ -z "${wifi_ip}" ]; then
+      control_log_msg "WiFi 连接中，等待 IP 地址"
+      return 0
+    fi
+
+    control_log_msg "WiFi: ${ssid}, BSSID: ${bssid}, IP: ${wifi_ip}"
+    save_wifi_state "${ssid}" "${bssid}" "${wifi_ip}"
+  else
+    control_log_msg "WiFi: 已断开"
+  fi
+
+  if should_enable_service "${wifi_status}" "${ssid}" "${bssid}"; then
+    control_log_msg "策略：启用服务"
+    start_service_if_needed
+  else
+    control_log_msg "策略：禁用服务"
+    stop_service_if_needed
+  fi
+
+  control_log_msg "完成"
+}
+
+if [ "${events}" = "w" ]; then
+  reset_event_logs
+  if [ ! -f "${BASE_DIR}/settings.ini" ]; then
+    net_log_warn "未找到 settings.ini，跳过本次处理"
+    exit 0
+  fi
+
+  . "${BASE_DIR}/settings.ini"
+  if [ -f "${BOX_PID_FILE}" ]; then
+    update_local_ip_rules
+  else
+    net_log_info "未检测到运行中的核心进程，跳过防回环规则更新"
+  fi
+  apply_network_control_policy
 fi

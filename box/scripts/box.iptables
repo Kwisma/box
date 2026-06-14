@@ -5,6 +5,8 @@ source /data/adb/box/settings.ini
 
 runtime_iptables_env="${box_run_state}/runtime.iptables.env"
 cnip_force_proxy_uid_list="${box_run_state}/cnip_force_proxy.uid.list"
+cap_cache_file="${box_run_state}/iptables.cap.env"
+ipset_stamp_dir="${box_run_state}/ipset.stamp"
 
 fwmark="16777216/16777216"
 table="2024"
@@ -125,6 +127,26 @@ is_box_custom_chain() {
   esac
 }
 
+add_core_bypass_rule() {
+  local table_name="$1"
+  local chain_name="$2"
+  local insert_action="$3"
+
+  [ -n "${insert_action}" ] || insert_action="-A"
+
+  if ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
+    return 0
+  fi
+  if ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -m owner --uid-owner "${box_user}" -j RETURN >/dev/null 2>&1; then
+    return 0
+  fi
+  if ${iptables} -t "${table_name}" "${insert_action}" "${chain_name}" -m owner --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
 del_rule_if_exists() {
   local table_name="$1"
   local chain_name="$2"
@@ -153,7 +175,41 @@ ip_rule_exists() {
   local fwmark="$2"
   local table_id="$3"
   local pref_id="$4"
-  ${ip_cmd} rule show pref "${pref_id}" 2>/dev/null | busybox grep -Eq "fwmark ${fwmark}[[:space:]].*lookup ${table_id}([[:space:]]|\$)"
+  local rule_lines mark_regex
+
+  rule_lines="$(${ip_cmd} rule show pref "${pref_id}" 2>/dev/null)" || return 1
+  [ -n "${rule_lines}" ] || return 1
+  mark_regex="$(fwmark_match_regex "${fwmark}")"
+
+  printf '%s\n' "${rule_lines}" | busybox grep -Eq "fwmark ${mark_regex}([[:space:]]|\$)" || return 1
+  printf '%s\n' "${rule_lines}" | busybox grep -Eq "lookup ${table_id}([[:space:]]|\$)"
+}
+
+fwmark_match_regex() {
+  local mark="$1"
+  local value mask hex_value hex_mask
+
+  value="${mark%%/*}"
+  if [ "${value}" != "${mark}" ]; then
+    mask="${mark#*/}"
+  else
+    mask=""
+  fi
+
+  case "${value}${mask}" in
+    ''|*[!0-9]*)
+      printf '%s\n' "${mark}"
+      return 0
+      ;;
+  esac
+
+  hex_value="$(printf '0x%x' "${value}")"
+  if [ -n "${mask}" ]; then
+    hex_mask="$(printf '0x%x' "${mask}")"
+    printf '(%s|%s/%s)\n' "${mark}" "${hex_value}" "${hex_mask}"
+  else
+    printf '(%s|%s)\n' "${mark}" "${hex_value}"
+  fi
 }
 
 ensure_ip_rule() {
@@ -216,6 +272,7 @@ runtime_save() {
     printf 'pref="%s"\n' "${pref}"
     printf 'tproxy_port="%s"\n' "${tproxy_port}"
     printf 'redir_port="%s"\n' "${redir_port}"
+    printf 'tun_device="%s"\n' "${tun_device}"
     printf 'mihomo_dns_port="%s"\n' "${mihomo_dns_port}"
     printf 'fake_ip_range="%s"\n' "${fake_ip_range}"
     printf 'fake_ip6_range="%s"\n' "${fake_ip6_range}"
@@ -237,6 +294,101 @@ runtime_load() {
 runtime_clear() {
   rm -f "${runtime_iptables_env}" >/dev/null 2>&1 || true
   log Debug "已清理运行时快照: ${runtime_iptables_env}"
+}
+
+runtime_env_value() {
+  local key="$1"
+  [ -f "${runtime_iptables_env}" ] || return 1
+  busybox awk -F'"' -v key="${key}" '$0 ~ ("^" key "=") { print $2; exit }' "${runtime_iptables_env}"
+}
+
+cleanup_mode_for_apply() {
+  local old_mode old_bin old_ipv6 old_dns old_tproxy old_redir old_tun
+
+  [ -f "${runtime_iptables_env}" ] || {
+    printf 'all\n'
+    return 0
+  }
+
+  old_mode="$(runtime_env_value "network_mode")"
+  old_bin="$(runtime_env_value "bin_name")"
+  old_ipv6="$(runtime_env_value "ipv6")"
+  old_dns="$(runtime_env_value "dns_hijack_mode")"
+  old_tproxy="$(runtime_env_value "tproxy_port")"
+  old_redir="$(runtime_env_value "redir_port")"
+  old_tun="$(runtime_env_value "tun_device")"
+
+  [ -n "${old_mode}" ] || {
+    printf 'all\n'
+    return 0
+  }
+
+  if [ "${old_mode}" != "${network_mode}" ] ||
+     [ "${old_bin}" != "${bin_name}" ] ||
+     [ "${old_ipv6}" != "${ipv6}" ] ||
+     [ "${old_dns}" != "${dns_hijack_mode}" ] ||
+     [ "${old_tproxy}" != "${tproxy_port}" ] ||
+     [ "${old_redir}" != "${redir_port}" ] ||
+     [ "${old_tun}" != "${tun_device}" ]; then
+    printf 'all\n'
+    return 0
+  fi
+
+  printf '%s\n' "${old_mode}"
+}
+
+current_boot_id() {
+  if [ -r /proc/sys/kernel/random/boot_id ]; then
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null
+    return 0
+  fi
+
+  busybox stat -c '%Y' /proc/1 2>/dev/null
+}
+
+load_capability_cache() {
+  local current_boot
+
+  [ -f "${cap_cache_file}" ] || return 1
+  current_boot="$(current_boot_id)"
+  [ -n "${current_boot}" ] || return 1
+
+  . "${cap_cache_file}" 2>/dev/null || return 1
+
+  [ "${cap_cache_boot_id}" = "${current_boot}" ] || return 1
+  [ -n "${cap_tproxy4}" ] || return 1
+  [ -n "${cap_tproxy6}" ] || return 1
+  [ -n "${cap_socket_match}" ] || return 1
+  [ -n "${cap_socket_transparent}" ] || return 1
+  [ -n "${cap_conntrack_match}" ] || return 1
+  [ -n "${cap_connmark_match}" ] || return 1
+  [ -n "${cap_connmark_target}" ] || return 1
+  [ -n "${cap_ipset}" ] || return 1
+  [ -n "${cap_ip6_nat}" ] || return 1
+
+  log Debug "能力探测: 使用缓存 ${cap_cache_file}"
+  return 0
+}
+
+save_capability_cache() {
+  local current_boot
+
+  current_boot="$(current_boot_id)"
+  [ -n "${current_boot}" ] || return 1
+  mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
+
+  {
+    printf 'cap_cache_boot_id="%s"\n' "${current_boot}"
+    printf 'cap_tproxy4="%s"\n' "${cap_tproxy4}"
+    printf 'cap_tproxy6="%s"\n' "${cap_tproxy6}"
+    printf 'cap_socket_match="%s"\n' "${cap_socket_match}"
+    printf 'cap_socket_transparent="%s"\n' "${cap_socket_transparent}"
+    printf 'cap_conntrack_match="%s"\n' "${cap_conntrack_match}"
+    printf 'cap_connmark_match="%s"\n' "${cap_connmark_match}"
+    printf 'cap_connmark_target="%s"\n' "${cap_connmark_target}"
+    printf 'cap_ipset="%s"\n' "${cap_ipset}"
+    printf 'cap_ip6_nat="%s"\n' "${cap_ip6_nat}"
+  } > "${cap_cache_file}" 2>/dev/null
 }
 
 cap_has_target() {
@@ -266,6 +418,10 @@ cap_has_match() {
 }
 
 probe_capabilities() {
+  if load_capability_cache; then
+    return 0
+  fi
+
   cap_tproxy4="false"
   cap_tproxy6="false"
   cap_socket_match="false"
@@ -297,6 +453,7 @@ probe_capabilities() {
 
   command -v ipset >/dev/null 2>&1 && cap_ipset="true"
   ip6_nat_supported && cap_ip6_nat="true"
+  save_capability_cache || true
 
   log Debug "能力探测: TPROXY(v4=${cap_tproxy4}, v6=${cap_tproxy6}) socket_match=${cap_socket_match}/${cap_socket_transparent} conntrack=${cap_conntrack_match} connmark(match=${cap_connmark_match}, target=${cap_connmark_target}) ipset=${cap_ipset} ip6_nat=${cap_ip6_nat}"
 }
@@ -352,14 +509,20 @@ setup_nat_dns_hijack() {
   local family="$3"
 
   ensure_chain nat "${chain_name}"
-  ensure_rule_insert nat "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  if ! add_core_bypass_rule nat "${chain_name}" -I; then
+    [ "${iptables}" = "$IPV" ] && log Warning "DNS 核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
+  fi
   if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
     for ignore in ${ignore_ap_list[@]} ; do
       ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
     done
   fi
-  ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -j REDIRECT --to-ports "${dns_port}"
-  ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  if dns_tcp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
+  if dns_udp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
   ensure_jump nat PREROUTING "${chain_name}"
   ensure_jump nat OUTPUT "${chain_name}"
 }
@@ -476,7 +639,9 @@ setup_nat_dns_forward() {
   local family="$3"
 
   ensure_chain nat "${chain_name}"
-  ensure_rule_insert nat "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  if ! add_core_bypass_rule nat "${chain_name}" -I; then
+    [ "${iptables}" = "$IPV" ] && log Warning "DNS 转发核心进程旁路失败，owner 匹配不可用，可能导致 DNS 回环。"
+  fi
   if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
     for ignore in ${ignore_ap_list[@]} ; do
       ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
@@ -872,9 +1037,27 @@ append_tun_dns_rules() {
   fi
 }
 
+append_tun_fake_ip_route_rules() {
+  local chain_name="$1"
+  local fake_range=""
+
+  if [ "${iptables}" = "$IPV" ]; then
+    fake_range="${fake_ip_range}"
+  else
+    fake_range="${fake_ip6_range}"
+  fi
+
+  [ -n "${fake_range}" ] || return 0
+
+  ensure_rule_append mangle "${chain_name}" -d "${fake_range}" -j MARK --set-xmark "${tun_route_mark}"
+  ensure_rule_append mangle "${chain_name}" -d "${fake_range}" -j RETURN
+}
+
 append_tun_bypass_destination_rules() {
   local chain_name="$1"
   local set_name=""
+
+  append_tun_fake_ip_route_rules "${chain_name}"
 
   if [ "${iptables}" = "$IPV" ]; then
     for subnet in ${intranet[@]} ; do
@@ -929,11 +1112,12 @@ append_tun_proxy_mode_rules() {
   esac
 }
 
-apply_tun_local_proxy_rules() {
+append_tun_core_bypass_rules() {
   local chain_name="$1"
 
-  ensure_rule_insert mangle "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
-  append_tun_proxy_mode_rules "${chain_name}"
+  if ! add_core_bypass_rule mangle "${chain_name}" -A; then
+    [ "${iptables}" = "$IPV" ] && log Warning "TUN 核心进程旁路失败，owner 匹配不可用，可能导致流量回环。"
+  fi
 }
 
 apply_tun_route_rules() {
@@ -1533,18 +1717,9 @@ cleanup_external_chain_common() {
 setup_local_chain_common() {
   local table_name="$1"
   local chain_name="$2"
-  local core_bypass_added="false"
   ensure_chain "${table_name}" "${chain_name}"
 
-  if ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
-    core_bypass_added="true"
-  elif ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --uid-owner "${box_user}" -j RETURN >/dev/null 2>&1; then
-    core_bypass_added="true"
-  elif ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
-    core_bypass_added="true"
-  fi
-
-  if [ "${core_bypass_added}" != "true" ]; then
+  if ! add_core_bypass_rule "${table_name}" "${chain_name}" -I; then
     ensure_rule_insert "${table_name}" "${chain_name}" -m mark --mark "${fwmark}" -j RETURN
     [ "${iptables}" = "$IPV" ] && log Warning "owner 匹配不可用，核心进程旁路已降级为 mark 规则。"
   fi
@@ -1818,15 +1993,31 @@ probe_user_group() {
   fi
 }
 
+set_ipv6_conf_all() {
+  local key="$1"
+  local value="$2"
+  local path
+
+  for path in /proc/sys/net/ipv6/conf/*/"${key}"; do
+    [ -e "${path}" ] || continue
+    echo "${value}" > "${path}" 2>/dev/null || true
+  done
+}
+
+restore_ipv6_ra_conf() {
+  set_ipv6_conf_all disable_ipv6 0
+  set_ipv6_conf_all autoconf 1
+  set_ipv6_conf_all accept_ra 2
+  set_ipv6_conf_all accept_ra_defrtr 1
+  set_ipv6_conf_all accept_ra_pinfo 1
+}
+
 disable_ipv6() {
   sysctl -w net.ipv4.ip_forward=1
   sysctl -w net.ipv6.conf.all.forwarding=0
 
-  sysctl -w net.ipv6.conf.all.accept_ra=0
-  sysctl -w net.ipv6.conf.wlan0.accept_ra=0
-  sysctl -w net.ipv6.conf.all.disable_ipv6=1
-  sysctl -w net.ipv6.conf.default.disable_ipv6=1
-  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=1
+  set_ipv6_conf_all accept_ra 0
+  set_ipv6_conf_all disable_ipv6 1
 
   # 添加不可达规则，阻断 IPv6 流量继续转发。
   ip -6 rule show pref "${pref}" 2>/dev/null | busybox grep -q "unreachable" || ip -6 rule add unreachable pref "${pref}"
@@ -1836,11 +2027,7 @@ ipv6_enable() {
   sysctl -w net.ipv4.ip_forward=1
   sysctl -w net.ipv6.conf.all.forwarding=1
 
-  sysctl -w net.ipv6.conf.all.accept_ra=2
-  sysctl -w net.ipv6.conf.wlan0.accept_ra=2
-  sysctl -w net.ipv6.conf.all.disable_ipv6=0
-  sysctl -w net.ipv6.conf.default.disable_ipv6=0
-  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=0
+  restore_ipv6_ra_conf
 
   # 移除不可达规则，恢复 IPv6 路由。
   ip -6 rule show pref "${pref}" 2>/dev/null | busybox grep -q "unreachable" && ip -6 rule del unreachable pref "${pref}" >/dev/null 2>&1 || true
@@ -1848,6 +2035,61 @@ ipv6_enable() {
   # 这里不全局阻断 IPv6 DNS，避免影响 TUN 模式下的 DNS 转发。
   del_rule_silent filter OUTPUT -p udp --destination-port 53 -j DROP 2>/dev/null || true
 } >/dev/null 2>&1
+
+collect_dynamic_ipv4_bypass_subnets() {
+  ip -4 addr show up 2>/dev/null | busybox awk -v tun="${tun_device}" '
+    /^[0-9]+: / {
+      iface=$2
+      sub(/:.*/, "", iface)
+      sub(/@.*/, "", iface)
+    }
+    /inet / {
+      addr=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "inet") {
+          addr=$(i + 1)
+          break
+        }
+      }
+      if (addr == "" || iface == tun) {
+        next
+      }
+      print addr
+    }
+  '
+}
+
+collect_dynamic_ipv6_bypass_subnets() {
+  ip -6 addr show up 2>/dev/null | busybox awk -v tun="${tun_device}" '
+    /^[0-9]+: / {
+      iface=$2
+      sub(/:.*/, "", iface)
+      sub(/@.*/, "", iface)
+    }
+    /inet6 / {
+      if ($0 !~ /scope global/) {
+        next
+      }
+      addr=""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "inet6") {
+          addr=$(i + 1)
+          break
+        }
+      }
+      if (addr == "" || iface == tun) {
+        next
+      }
+      if (addr ~ /^fe80/ || addr ~ /^::1/) {
+        next
+      }
+      if ($0 ~ / tentative/ || $0 ~ / dadfailed/) {
+        next
+      }
+      print addr
+    }
+  '
+}
 
 intranet=(
   0.0.0.0/8
@@ -1868,8 +2110,8 @@ intranet=(
   255.255.255.0/24
   255.255.255.255/32
 )
-# 同时补充设备当前已有的 IPv4 地址段，避免本机地址被误导流。
-intranet+=($(ip -4 a | busybox awk '/inet/ {print $2}' | busybox grep -vE "^127.0.0.1"))
+# 同时补充设备当前已有的非 TUN IPv4 地址段，避免本机地址被误导流。
+intranet+=($(collect_dynamic_ipv4_bypass_subnets))
 
 intranet6=(
   ::/128
@@ -1882,15 +2124,79 @@ intranet6=(
   2001:20::/28
   2001:db8::/32
   2002::/16
-  fc00::/7
   fe80::/10
   ff00::/8
 )
-intranet6+=($(ip -6 a | busybox awk '/inet6/ {print $2}' | busybox grep -vE "^fe80|^::1|^fd00"))
+intranet6+=($(collect_dynamic_ipv6_bypass_subnets))
 
 # 检测内核是否支持 ip6tables nat 表。
 ip6_nat_supported() {
   ip6tables -t nat -L >/dev/null 2>&1
+}
+
+ipset_stamp_file() {
+  local set_name="$1"
+  printf '%s/%s.stamp\n' "${ipset_stamp_dir}" "${set_name}"
+}
+
+ipset_source_stamp() {
+  local source_file="$1"
+  busybox stat -c '%s:%Y' "${source_file}" 2>/dev/null
+}
+
+ipset_has_entries() {
+  local set_name="$1"
+  local entries
+
+  entries="$(ipset list -terse "${set_name}" 2>/dev/null | busybox awk '/^Number of entries:/ {print $4; exit}')"
+  case "${entries}" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      [ "${entries}" -gt 0 ]
+      return $?
+      ;;
+  esac
+
+  entries="$(ipset list "${set_name}" 2>/dev/null | busybox awk '/^Number of entries:/ {print $4; exit}')"
+  case "${entries}" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    *)
+      [ "${entries}" -gt 0 ]
+      ;;
+  esac
+}
+
+ipset_should_reload() {
+  local set_name="$1"
+  local source_file="$2"
+  local stamp_file current_stamp old_stamp
+
+  [ -f "${source_file}" ] || return 1
+
+  current_stamp="$(ipset_source_stamp "${source_file}")"
+  [ -n "${current_stamp}" ] || return 0
+
+  stamp_file="$(ipset_stamp_file "${set_name}")"
+  old_stamp="$(cat "${stamp_file}" 2>/dev/null)"
+  [ "${current_stamp}" != "${old_stamp}" ] && return 0
+
+  ipset_has_entries "${set_name}" || return 0
+  return 1
+}
+
+ipset_write_stamp() {
+  local set_name="$1"
+  local source_file="$2"
+  local stamp_file current_stamp
+
+  current_stamp="$(ipset_source_stamp "${source_file}")"
+  [ -n "${current_stamp}" ] || return 1
+  mkdir -p "${ipset_stamp_dir}" >/dev/null 2>&1 || true
+  stamp_file="$(ipset_stamp_file "${set_name}")"
+  printf '%s\n' "${current_stamp}" > "${stamp_file}" 2>/dev/null
 }
 
 # 中国大陆 IP 集的载入与清理。
@@ -1902,14 +2208,19 @@ setup_cn_ipset() {
   fi
   # 载入中国大陆 IPv4 地址段。
   if [ "${bypass_cn_ip_v4}" = "true" ] && [ -f "${cn_ip_file}" ]; then
-    if {
-      echo "create cnip hash:net family inet hashsize 8192 maxelem 65536 -exist"
-      echo "flush cnip"
-      awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip %s\n", $0}' "${cn_ip_file}"
-    } | ipset restore -exist 2>/dev/null; then
-      log Info "已加载中国大陆 IPv4 段到 ipset: cnip"
+    if ipset_should_reload cnip "${cn_ip_file}"; then
+      if {
+        echo "create cnip hash:net family inet hashsize 8192 maxelem 65536 -exist"
+        echo "flush cnip"
+        busybox awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip %s\n", $0}' "${cn_ip_file}"
+      } | ipset restore -exist 2>/dev/null; then
+        ipset_write_stamp cnip "${cn_ip_file}" || true
+        log Info "已加载中国大陆 IPv4 段到 ipset: cnip"
+      else
+        log Warning "加载 cnip 失败"
+      fi
     else
-      log Warning "加载 cnip 失败"
+      log Debug "cnip 未变化且已有内容，跳过 IPv4 ipset 导入"
     fi
   else
     log Debug "跳过 IPv4 ipset 载入（未启用或文件不存在）"
@@ -1917,14 +2228,19 @@ setup_cn_ipset() {
   # 载入中国大陆 IPv6 地址段。
   if [ "${ipv6}" = "true" ]; then
     if [ "${bypass_cn_ip_v6}" = "true" ] && [ -f "${cn_ipv6_file}" ]; then
-      if {
-        echo "create cnip6 hash:net family inet6 hashsize 8192 maxelem 65536 -exist"
-        echo "flush cnip6"
-        awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip6 %s\n", $0}' "${cn_ipv6_file}"
-      } | ipset restore -exist 2>/dev/null; then
-        log Info "已加载中国大陆 IPv6 段到 ipset: cnip6"
+      if ipset_should_reload cnip6 "${cn_ipv6_file}"; then
+        if {
+          echo "create cnip6 hash:net family inet6 hashsize 8192 maxelem 65536 -exist"
+          echo "flush cnip6"
+          busybox awk '!/^[[:space:]]*#/ && NF > 0 {printf "add cnip6 %s\n", $0}' "${cn_ipv6_file}"
+        } | ipset restore -exist 2>/dev/null; then
+          ipset_write_stamp cnip6 "${cn_ipv6_file}" || true
+          log Info "已加载中国大陆 IPv6 段到 ipset: cnip6"
+        else
+          log Warning "加载 cnip6 失败"
+        fi
       else
-        log Warning "加载 cnip6 失败"
+        log Debug "cnip6 未变化且已有内容，跳过 IPv6 ipset 导入"
       fi
     else
       log Debug "跳过 IPv6 ipset 载入（未启用或文件不存在）"
@@ -1933,9 +2249,22 @@ setup_cn_ipset() {
 }
 
 cleanup_cn_ipset() {
+  local cleanup_mode="${1:-keep}"
+
   command -v ipset >/dev/null 2>&1 || return 0
-  ipset flush cnip 2>/dev/null || true
-  ipset flush cnip6 2>/dev/null || true
+  case "${cleanup_mode}" in
+    flush)
+      ipset flush cnip 2>/dev/null || true
+      ipset flush cnip6 2>/dev/null || true
+      ;;
+    destroy)
+      ipset destroy cnip 2>/dev/null || true
+      ipset destroy cnip6 2>/dev/null || true
+      ;;
+    *)
+      log Debug "保留 cnip/cnip6 ipset 内容以加快下次启动"
+      ;;
+  esac
 }
 probe_tun_device() {
   ip link show "${tun_device}" >/dev/null 2>&1 && return 0
@@ -1987,9 +2316,10 @@ start_tun_bypass() {
   append_tun_dns_rules "${pre_chain}"
   append_tun_bypass_destination_rules "${pre_chain}"
 
+  append_tun_core_bypass_rules "${out_chain}"
   append_tun_dns_rules "${out_chain}"
   append_cnip_force_proxy_tun_rules "${out_chain}"
-  apply_tun_local_proxy_rules "${out_chain}"
+  append_tun_proxy_mode_rules "${out_chain}"
   append_tun_bypass_destination_rules "${out_chain}"
 
   ensure_jump mangle PREROUTING "${pre_chain}" || {
@@ -2090,20 +2420,52 @@ stop_tproxy() {
 }
 
 cleanup_iptables_family() {
-  stop_redirect
-  stop_tproxy
-  stop_tun_bypass
-  forward -D
+  local cleanup_mode="${1:-all}"
+
+  case "${cleanup_mode}" in
+    redirect)
+      stop_redirect
+      ;;
+    tproxy)
+      stop_tproxy
+      ;;
+    enhance)
+      stop_redirect
+      stop_tproxy
+      ;;
+    mixed)
+      stop_redirect
+      forward -D
+      ;;
+    tun)
+      stop_tun_bypass
+      forward -D
+      ;;
+    all|*)
+      stop_redirect
+      stop_tproxy
+      stop_tun_bypass
+      forward -D
+      ;;
+  esac
 
   if [ "${iptables}" = "$IP6V" ]; then
     del_rule_if_exists filter OUTPUT -p udp --destination-port 53 -j DROP
   fi
 }
 
-cleanup_iptables() {
-  for iptables in "$IPV" "$IP6V"; do
-    iptables="${iptables}" && cleanup_iptables_family > /dev/null 2>&1
+cleanup_iptables_for_mode() {
+  local cleanup_mode="${1:-all}"
+  local current_iptables
+
+  for current_iptables in "$IPV" "$IP6V"; do
+    iptables="${current_iptables}"
+    cleanup_iptables_family "${cleanup_mode}" > /dev/null 2>&1
   done
+}
+
+cleanup_iptables() {
+  cleanup_iptables_for_mode all
 }
 
 setup_cn_ipset_if_needed() {
@@ -2113,8 +2475,10 @@ setup_cn_ipset_if_needed() {
 }
 
 cleanup_cn_ipset_if_needed() {
-  if [ "${bypass_cn_ip}" = "true" ]; then
-    cleanup_cn_ipset
+  local cleanup_mode="${1:-keep}"
+
+  if [ "${bypass_cn_ip}" = "true" ] || [ "${cleanup_mode}" != "keep" ]; then
+    cleanup_cn_ipset "${cleanup_mode}"
   fi
 }
 
@@ -2127,12 +2491,16 @@ wait_tun_ready() {
 }
 
 prepare_rule_apply() {
+  local cleanup_mode
+
   probe_user_group || {
     log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
   }
   prepare_cnip_force_proxy_uids
   log_iptables_results
-  cleanup_iptables
+  cleanup_mode="$(cleanup_mode_for_apply)"
+  log Debug "iptables 定向清理模式: ${cleanup_mode}"
+  cleanup_iptables_for_mode "${cleanup_mode}"
 }
 
 apply_redirect_family() {
@@ -2173,12 +2541,25 @@ apply_tun_family() {
     log Info "TUN 模式下忽略性能模式"
   fi
 
-  if forward -I && start_tun_bypass; then
+  if ! forward -I; then
+    log Error "$(tun_bypass_family_label) TUN 规则创建失败。"
+    forward -D > /dev/null 2>&1
+    return 1
+  fi
+
+  if [ "${bypass_cn_ip}" != "true" ]; then
+    stop_tun_bypass > /dev/null 2>&1
+    log Info "$(tun_bypass_family_label) TUN 规则创建完成。"
+    return 0
+  fi
+
+  if start_tun_bypass; then
     log Info "$(tun_bypass_family_label) TUN 规则创建完成。"
   else
     log Error "$(tun_bypass_family_label) TUN 规则创建失败。"
     stop_tun_bypass > /dev/null 2>&1
     forward -D > /dev/null 2>&1
+    return 1
   fi
 }
 
@@ -2191,8 +2572,11 @@ log_iptables_results() {
   [ -n "$applied_uids" ] && log Debug "UID 列表: ${applied_uids}"
 }
 
+runtime_loaded="false"
 if [ "$1" = "disable" ]; then
-  runtime_load >/dev/null 2>&1 || true
+  if runtime_load >/dev/null 2>&1; then
+    runtime_loaded="true"
+  fi
 fi
 
 if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
@@ -2281,14 +2665,15 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
       bin_alive && log Info "${bin_name} 已连接。"
       ;;
     disable)
-      runtime_load >/dev/null 2>&1 || true
+      cleanup_mode="all"
+      [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
       ipv6_enable
       probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
       log Warning "正在清理 iptables 透明代理规则。"
 
-      cleanup_iptables
+      cleanup_iptables_for_mode "${cleanup_mode}"
 
-      cleanup_cn_ipset_if_needed
+      cleanup_cn_ipset_if_needed "${2:-keep}"
 
       runtime_clear
 
@@ -2330,13 +2715,14 @@ else
       bin_alive && log Info "${bin_name} 已连接。"
       ;;
     disable)
-      runtime_load >/dev/null 2>&1 || true
+      cleanup_mode="all"
+      [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
       ipv6_enable
       probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
       log Warning "正在清理 TUN 规则。"
 
-      cleanup_iptables
-      cleanup_cn_ipset_if_needed
+      cleanup_iptables_for_mode "${cleanup_mode}"
+      cleanup_cn_ipset_if_needed "${2:-keep}"
 
       runtime_clear
 

@@ -32,7 +32,7 @@ start_service() {
   fi
   
   if [ "$boot_auto_start" = "false" ]; then
-    echo "开机自启已禁用，跳过启动核心服务。"
+    log Info "开机自启已禁用，跳过启动核心服务。"
     return 0
   fi
   
@@ -79,7 +79,7 @@ start_inotifyd() {
   net_inotifyd
 }
 
-mkdir -p /data/adb/box/run/ /data/adb/box/run/state/ /data/adb/box/run/locks/ >/dev/null 2>&1 || true
+mkdir -p /data/adb/box/run/ /data/adb/box/run/state/ >/dev/null 2>&1 || true
 if [ -f "/data/adb/box/manual" ]; then
   if [ -f "/data/adb/box/run/box.pid" ]; then
       rm /data/adb/box/run/box.pid
