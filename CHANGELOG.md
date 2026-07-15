@@ -1,3 +1,16 @@
+#### Changelog 1.2.9 - 15-07-2026
+- 1.2.8 (7d0f5ff)
+- 1.2.8 (e33c788)
+- fix: 修复不完整的 UA (1999c69)
+- feat: 添加 mihomo 和 sing-box 可执行文件 (4bc829a)
+- Update crontab.cfg (6b13e91)
+- Add function to retrieve core version information (25ce51f)
+- feat(core): 优化CPU 核心分配与 eBPF 配置 (11293cd)
+- feat(net): 引入 eBPF 分流与 iptables 批量下发，并发化服务启停 (ec06227)
+- Delete tests directory (0af1b62)
+- feat: support force proxy CIDRs across modes (e4758f1)
+- fix: allow force proxy CIDRs in TUN mode (ba703ec)
+
 #### Changelog 1.2.8 - 14-06-2026
 - 1.2.8 (ab94b42)
 - fix(log): 统一脚本日志输出 (dfa2661)
